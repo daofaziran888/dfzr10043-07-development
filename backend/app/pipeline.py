@@ -11,10 +11,13 @@
 链路8  资源额度耗尽 → 机器人节点降级 → 任务队列回收
 链路9  OCR识别区域 → 采集批次归集 → 抽检样本 → 交接包驳回
 链路10 运行指标汇总 → 执行实例逐条核对 → 审计轨迹
+链路11 排程暂停→恢复 → 应采日期缺口核对 → 补采任务派发 → 批次回执确认 → 队列领取复核
 
 额外能力：水位推进（data_landing watermark）、冲突版本仲裁（version_release rollback =
 旧版本胜出）、失败恢复（retry_policy 重试→放弃→审计）、去重（capture_batch 按采集窗
 口与上游来源判重，重复批次不落库）、迟到数据（schedule_plan 生效止日已过则拒绝投递）。
+补采只覆盖计划原本生效的采集窗口，同一日期只认一份有效批次；入队/派发不算完成，
+接收方只能拿到有效回执对应的数据。
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from app import backfill
 from app.services import service_for
 
 # ── 通用工具 ──────────────────────────────────────────────────
@@ -146,9 +150,21 @@ def publish_flow_and_schedule(template_id: int, plan_payload: dict[str, Any]) ->
 # ── 链路2: 文件归集校验 → 采集批次确认 → 字段映射生效 → 数据落库 → 交接包消费 ─
 
 def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]],
-                                 mapping_ids: list[int]) -> dict[str, Any]:
-    """归集流程执行产生的文件，校验后确认采集批次，经字段映射落库并打包交接。"""
+                                 mapping_ids: list[int],
+                                 capture_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """归集流程执行产生的文件，校验后确认采集批次，经字段映射落库并打包交接。
+
+    ``capture_payload`` 可带``计划编号``/``采集日期``，用于把批次挂到计划窗口；
+    同一计划同一采集日期只认第一份有效批次，迟到补报返回``duplicate``。
+    """
     run_entry = _find_entry("flow_run", run_id)
+    capture_payload = capture_payload or {}
+    plan_svc = service_for("schedule_plan")
+    plan = plan_svc.find_plan(capture_payload.get("计划编号")) if capture_payload.get("计划编号") else None
+    capture_date = str(capture_payload.get("采集日期") or "").strip()
+    if capture_date and plan is not None and capture_date not in backfill.expected_dates(
+            plan, capture_payload.get("as_of")):
+        return {"status": "rejected", "reason": f"采集日期{capture_date}不在计划生效窗口内"}
 
     # 文件归集
     file_svc = service_for("file_drop")
@@ -178,29 +194,50 @@ def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]]
     )
     batch_checksum = _checksum(batch_payload)
 
-    # 去重：按采集窗口+上游来源判重，重复批次不落库
+    # 去重：优先按计划+采集日期判重；没有采集日期时沿用采集窗口+上游来源判重
     existing = batch_svc.list_entries(size=10000)[0]
     dup_check = f"{run_entry.get('执行编号')}:{run_id}"
-    duplicate = any(
-        e.get("上游来源") == dup_check
-        for e in existing
-    )
-    if duplicate:
-        return {"status": "duplicate", "reason": "采集窗口与上游来源重复，批次已存在"}
+    if capture_date and plan is not None:
+        effective = batch_svc.find_effective(plan, capture_date)
+        if effective is not None:
+            return {
+                "status": "duplicate",
+                "reason": f"采集日期{capture_date}已有有效批次，只认一次",
+                "duplicate_of": effective.get("批次编号"),
+                "batch_id": effective.get("id"),
+            }
+    else:
+        duplicate = any(
+            e.get("上游来源") == dup_check
+            for e in existing
+        )
+        if duplicate:
+            return {"status": "duplicate", "reason": "采集窗口与上游来源重复，批次已存在"}
 
     batch_values = {
-        "批次编号": f"CAPT-R{run_id}",
+        "批次编号": capture_payload.get("批次编号", f"CAPT-R{run_id}"),
         "关联执行": run_entry.get("执行编号", ""),
         "记录行数": str(len(collected)),
-        "采集窗口": f"[{_now_iso()[:10]}]",
+        "采集窗口": f"[{capture_date or _now_iso()[:10]}]",
         "完整性校验": batch_checksum,
         "批次标签": "file-collect",
         "上游来源": dup_check,
         "生成时间": _now_iso(),
+        "计划编号": backfill.plan_key(plan) if plan is not None else "",
+        "采集日期": capture_date,
+        "回执编号": "",
+        "回执状态": "",
     }
     batch_result, _ = batch_svc.create_entry(batch_values)
     batch_svc.run_action(batch_result["id"], "启动校验")
-    batch_svc.run_action(batch_result["id"], "确认批次")
+    receipt = batch_svc.confirm_batch(batch_result["id"])
+    if receipt["status"] == "duplicate":
+        return {
+            "status": "duplicate",
+            "reason": receipt.get("reason", "同一采集日期已有有效批次"),
+            "duplicate_of": receipt.get("duplicate_of"),
+            "batch_id": batch_result["id"],
+        }
 
     # 字段映射生效
     mapping_svc = service_for("field_mapping")
@@ -250,6 +287,12 @@ def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]]
     return {
         "status": "landed",
         "batch_id": batch_result["id"],
+        "batch_code": batch_values["批次编号"],
+        "capture_date": capture_date,
+        "receipt": receipt.get("receipt"),
+        "receipt_status": receipt.get("receipt_status", "有效"),
+        "pending_dates": receipt.get("pending_dates", []),
+        "closed_backfill_tasks": receipt.get("closed_backfill_tasks", []),
         "landing_id": landing_result["id"],
         "handoff_id": handoff_result["id"],
         "conflict_rows": conflict_rows,
@@ -607,3 +650,128 @@ def summarize_metrics(metric_id: int) -> dict[str, Any]:
         "mismatch": mismatch,
         "audit_id": audit_result["id"],
     }
+
+# ── 链路11: 恢复排程 → 缺口核对 → 补采派发 → 回执确认 → 队列领取复核 ─
+
+def audit_plan_gaps(plan_id: int, as_of: Any = None) -> dict[str, Any]:
+    """核对排程计划的应采日期与已确认批次，返回真实待补范围。"""
+    plan_svc = service_for("schedule_plan")
+    plan = plan_svc.find_plan(plan_id)
+    if plan is None:
+        return {"ok": False, "status": "missing", "reason": f"排程计划 {plan_id} 不存在"}
+    analysis = plan_svc.audit_gaps(plan, as_of)
+    return {"ok": True, "status": "audited", **analysis}
+
+
+def resume_schedule_and_backfill(plan_id: int, *, as_of: Any = None,
+                                 dispatch: bool = False,
+                                 operator: str = "duty") -> dict[str, Any]:
+    """恢复已暂停排程，按计划窗口找漏采日期并登记/派发补采任务。
+
+    返回里的``待补日期``在补采任务仅入队时仍保留，只有确认了有效批次才会减少。
+    """
+    plan_svc = service_for("schedule_plan")
+    plan = plan_svc.find_plan(plan_id)
+    if plan is None:
+        return {"ok": False, "status": "missing", "reason": f"排程计划 {plan_id} 不存在"}
+    if plan.get("status") == "已过期":
+        return {
+            "ok": False,
+            "status": "refused",
+            "reason": "排程已终止，不能恢复；请新建计划",
+            "plan_id": int(plan["id"]),
+        }
+    return plan_svc.resume_and_backfill(
+        plan, as_of=as_of, dispatch=dispatch, operator=operator)
+
+
+def pause_schedule(plan_id: int, operator: str = "duty") -> dict[str, Any]:
+    """暂停排程：保留计划窗口，恢复时据此核对漏采日期。"""
+    plan_svc = service_for("schedule_plan")
+    plan = plan_svc.find_plan(plan_id)
+    if plan is None:
+        return {"ok": False, "status": "missing", "reason": f"排程计划 {plan_id} 不存在"}
+    plan_svc.run_action(int(plan["id"]), "暂停排程")
+    return {
+        "ok": True,
+        "status": "paused",
+        "plan_id": int(plan["id"]),
+        "计划编号": backfill.plan_key(plan),
+        "window": backfill.plan_window(plan),
+        "operator": operator,
+    }
+
+
+def claim_backfill_task(task_id: int, node_code: str = "") -> dict[str, Any]:
+    """队列领取补采任务：先按当前已确认批次复核缺口，已覆盖的直接关闭。
+
+    返回``pending_dates``表示领取后仍未完成的日期——入队/领取都不算完成，
+    必须有有效回执的已确认批次才把日期从待补范围里去掉。
+    """
+    queue_svc = service_for("task_queue")
+    plan_svc = service_for("schedule_plan")
+    task = queue_svc.get_entry(task_id)
+    if task is None:
+        return {"ok": False, "status": "missing", "reason": f"排队任务 {task_id} 不存在"}
+
+    plan = plan_svc.find_plan(task.get("计划编号") or "") if task.get("计划编号") else None
+    if plan is None and backfill.is_backfill_task(task):
+        plan = plan_svc.find_plan(task.get("计划编号") or task.get("关联模板") or "")
+    if plan is None:
+        if str(task.get("status")) != "待派发":
+            return {"ok": False, "status": "not_pending", "reason": "任务状态不是待派发"}
+        result = queue_svc.dispatch_to_node(task_id, node_code)
+        return {"ok": result["ok"], "status": "dispatched" if result["ok"] else "failed",
+                "task_id": task_id, "pending_dates": [], **result}
+
+    capture_date = str(task.get("采集日期") or "")
+    analysis = plan_svc.audit_gaps(plan)
+    if backfill.is_backfill_task(task) and capture_date not in analysis["missing_dates"]:
+        closed = queue_svc.close_task(
+            task_id, str(task.get("关联批次") or ""),
+            f"领取时复核：{capture_date}已由有效批次覆盖")
+        return {
+            "ok": True,
+            "status": "obsolete",
+            "task_id": task_id,
+            "采集日期": capture_date,
+            "closed": closed is not None,
+            "reason": f"采集日期{capture_date}已由有效批次覆盖，不再派发",
+            "pending_dates": analysis["missing_dates"],
+            "plan_id": plan.get("id"),
+        }
+
+    if str(task.get("status")) != "待派发":
+        return {
+            "ok": False,
+            "status": "not_pending",
+            "reason": "任务状态不是待派发",
+            "pending_dates": analysis["missing_dates"],
+        }
+    result = queue_svc.dispatch_to_node(task_id, node_code)
+    return {
+        "ok": result["ok"],
+        "status": "claimed" if result["ok"] else "failed",
+        "task_id": task_id,
+        "采集日期": capture_date,
+        "plan_id": plan.get("id"),
+        "pending_dates": analysis["missing_dates"],
+        "reason": "任务已领取，但在有效批次确认前该日期仍属待补",
+    }
+
+
+def confirm_capture_batch(batch_id: int, operator: str = "duty",
+                          as_of: Any = None) -> dict[str, Any]:
+    """确认采集批次：判重、写回执、关闭同日期补采任务并回写计划缺口。"""
+    batch_svc = service_for("capture_batch")
+    return batch_svc.confirm_batch(batch_id, operator=operator, as_of=as_of)
+
+
+def receiver_capture_data(plan_id: int, as_of: Any = None) -> dict[str, Any]:
+    """接收方取数：只返回有效回执对应的批次，并给出仍待补的日期。"""
+    plan_svc = service_for("schedule_plan")
+    plan = plan_svc.find_plan(plan_id)
+    if plan is None:
+        return {"ok": False, "status": "missing", "reason": f"排程计划 {plan_id} 不存在"}
+    payload = plan_svc.receiver_data(plan, as_of)
+    return {"ok": True, "status": "delivered", **payload}
